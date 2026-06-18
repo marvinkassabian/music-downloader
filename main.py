@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 from pathlib import Path
 
 import yt_dlp
+from worker_pool import DownloadJob, run_download_jobs
 
 # ---------------------------
 # Manual configuration
@@ -15,21 +17,20 @@ import yt_dlp
 
 # Add playlist links here.
 PLAYLIST_URLS: list[str] = [
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7KaQTS_faNh21PEs2IRbNPE5&si=nd2LgUejIEkSq_YR",
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7KZNG0Ia7GYJ-FiaPrDX7All&si=vKHOFY21Daz6GY-E",
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7Kavdyws4mqjr8h2ZeXXP3p-&si=w7DUYvqX9XnQgNWS",
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7KZpRvzTltw9RupIKjUBX9hR&si=aZdYQPyv6reAhZY8",
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7KYQR6PomU8P26NYCQl6IJoL&si=JxtNNAzJZ5QUHMvD",
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7Ka6WzZhXGPtPq1dqS5TO95p&si=QZXQZ_-jnqTRQChv",
-    "https://music.youtube.com/playlist?list=PLRZ3iHgMV7KY9RQFEgTSFPeuvLsnNhPfX&si=aptcjgaMNGtZV1yw",
+    "https://music.youtube.com/playlist?list=OLAK5uy_nWrBd-n_L0xHfL8lmH-qM9U2cTlKAOQYs&si=hN2DWt7sTW3zH4xv",
+    "https://music.youtube.com/playlist?list=OLAK5uy_l38_t-faETNnZv7FZ_RjtYvl_hXVHPpX4&si=prC6pxFErvZ5nAAA",
+    "https://music.youtube.com/playlist?list=OLAK5uy_ngnO6lTnpFPdCvgcTxnnC8fRdMmFn2jkA&si=ZuK4tY55eozWmLPM",
+    "https://music.youtube.com/playlist?list=OLAK5uy_k-axKCdj15ZavMsthn-PVNfA3Qxw3FZgE&si=M8JIv_vIf_iUyoJ5",
+    "https://music.youtube.com/playlist?list=OLAK5uy_kp9KxtkuU6hADyESsiqnQZEB264vvInPw",
 ]
 
 # Optional: one URL per line. Lines starting with # are ignored.
 PLAYLISTS_FILE: str | None = "playlists.txt"
 
-OUTPUT_TEMPLATE = "downloads/%(playlist_title)s/%(playlist_index)03d - %(title)s.%(ext)s"
 AUDIO_FORMAT = "mp3"  # mp3, m4a, opus, wav, flac
 AUDIO_QUALITY = "0"   # 0 is best for mp3
+MAX_DOWNLOAD_WORKERS = 6  # Cap for auto workers; use 0 to disable cap.
+CONCURRENT_FRAGMENT_DOWNLOADS = 4  # Per-track network fragment concurrency.
 
 # Optional: chrome, chromium, firefox, edge, safari, brave, opera, vivaldi
 COOKIES_FROM_BROWSER: str | None = None
@@ -65,10 +66,9 @@ def collect_urls() -> list[str]:
 def build_ydl_options() -> dict:
     options: dict = {
         "format": "bestaudio/best",
-        "outtmpl": OUTPUT_TEMPLATE,
         "ignoreerrors": True,
-        "noplaylist": False,
         "nooverwrites": True,  # skip a track if the output file already exists
+        "concurrent_fragment_downloads": CONCURRENT_FRAGMENT_DOWNLOADS,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -86,6 +86,78 @@ def build_ydl_options() -> dict:
         options["simulate"] = True
 
     return options
+
+
+def safe_name(value: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]', "_", value).strip().rstrip(".")
+    return cleaned or "untitled"
+
+
+def build_extract_options() -> dict:
+    options: dict = {
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "ignoreerrors": True,
+        "noplaylist": False,
+        "quiet": True,
+    }
+    if COOKIES_FROM_BROWSER:
+        options["cookiesfrombrowser"] = (COOKIES_FROM_BROWSER,)
+    return options
+
+
+def resolve_track_url(entry: dict) -> str | None:
+    direct_url = entry.get("url")
+    if isinstance(direct_url, str) and direct_url.startswith("http"):
+        return direct_url
+
+    webpage_url = entry.get("webpage_url")
+    if isinstance(webpage_url, str) and webpage_url.startswith("http"):
+        return webpage_url
+
+    video_id = entry.get("id")
+    if isinstance(video_id, str) and video_id:
+        return f"https://music.youtube.com/watch?v={video_id}"
+
+    return None
+
+
+def build_jobs_for_playlist(playlist_url: str) -> list[DownloadJob]:
+    try:
+        with yt_dlp.YoutubeDL(build_extract_options()) as ydl:
+            info = ydl.extract_info(playlist_url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        print(f"Failed to read playlist {playlist_url}: {exc}", file=sys.stderr)
+        return []
+
+    if not info:
+        return []
+
+    playlist_title = safe_name(str(info.get("title") or info.get("id") or "Unknown Playlist"))
+    entries = info.get("entries") or []
+
+    jobs: list[DownloadJob] = []
+    seen_base_names: set[str] = set()
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+
+        track_url = resolve_track_url(entry)
+        if not track_url:
+            continue
+
+        track_title = safe_name(str(entry.get("title") or entry.get("id") or f"track-{index:03d}"))
+        base_name = f"{index:03d} - {track_title}"
+
+        # Dedupe only within the same playlist by final output basename.
+        if base_name in seen_base_names:
+            continue
+        seen_base_names.add(base_name)
+
+        output_path = Path("downloads") / playlist_title / f"{base_name}.{AUDIO_FORMAT}"
+        jobs.append(DownloadJob(url=track_url, output_path=output_path, playlist_name=playlist_title))
+
+    return jobs
 
 
 def main() -> int:
@@ -108,14 +180,11 @@ def main() -> int:
         print("Tip: install a JS runtime to reduce yt-dlp YouTube warnings.", file=sys.stderr)
         print("Example: sudo apt install -y nodejs", file=sys.stderr)
 
-    try:
-        with yt_dlp.YoutubeDL(build_ydl_options()) as ydl:
-            result = ydl.download(urls)
-    except yt_dlp.utils.DownloadError as exc:
-        print(f"Download failed: {exc}", file=sys.stderr)
-        return 1
+    jobs: list[DownloadJob] = []
+    for playlist_url in urls:
+        jobs.extend(build_jobs_for_playlist(playlist_url))
 
-    return 0 if result == 0 else 1
+    return run_download_jobs(jobs, build_ydl_options(), MAX_DOWNLOAD_WORKERS)
 
 
 if __name__ == "__main__":
