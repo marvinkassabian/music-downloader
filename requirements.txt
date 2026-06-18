@@ -1,0 +1,4 @@
+yt-dlp>=2026.6.9
+
+# System dependency (not installable via pip): ffmpeg
+# Ubuntu/Pop!_OS: sudo apt update && sudo apt install -y ffmpeg
