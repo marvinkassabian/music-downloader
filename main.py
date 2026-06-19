@@ -7,8 +7,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 from worker_pool import DownloadJob, run_download_jobs
 
 # ---------------------------
@@ -31,9 +33,14 @@ AUDIO_FORMAT = "mp3"  # mp3, m4a, opus, wav, flac
 AUDIO_QUALITY = "0"   # 0 is best for mp3
 MAX_DOWNLOAD_WORKERS = 6  # Cap for auto workers; use 0 to disable cap.
 CONCURRENT_FRAGMENT_DOWNLOADS = 4  # Per-track network fragment concurrency.
+NETWORK_RETRIES = 8
+FRAGMENT_RETRIES = 8
+EXTRACTOR_RETRIES = 5
 
 # Optional: chrome, chromium, firefox, edge, safari, brave, opera, vivaldi
 COOKIES_FROM_BROWSER: str | None = None
+# Optional: Netscape cookie file exported for yt-dlp (helps with age-restricted videos)
+COOKIES_FILE: str | None = None
 
 DRY_RUN = False
 
@@ -69,6 +76,10 @@ def build_ydl_options() -> dict:
         "ignoreerrors": True,
         "nooverwrites": True,  # skip a track if the output file already exists
         "concurrent_fragment_downloads": CONCURRENT_FRAGMENT_DOWNLOADS,
+        "retries": NETWORK_RETRIES,
+        "fragment_retries": FRAGMENT_RETRIES,
+        "extractor_retries": EXTRACTOR_RETRIES,
+        "file_access_retries": 3,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -80,6 +91,9 @@ def build_ydl_options() -> dict:
 
     if COOKIES_FROM_BROWSER:
         options["cookiesfrombrowser"] = (COOKIES_FROM_BROWSER,)
+
+    if COOKIES_FILE:
+        options["cookiefile"] = COOKIES_FILE
 
     if DRY_RUN:
         options["skip_download"] = True
@@ -103,6 +117,8 @@ def build_extract_options() -> dict:
     }
     if COOKIES_FROM_BROWSER:
         options["cookiesfrombrowser"] = (COOKIES_FROM_BROWSER,)
+    if COOKIES_FILE:
+        options["cookiefile"] = COOKIES_FILE
     return options
 
 
@@ -124,9 +140,9 @@ def resolve_track_url(entry: dict) -> str | None:
 
 def build_jobs_for_playlist(playlist_url: str) -> list[DownloadJob]:
     try:
-        with yt_dlp.YoutubeDL(build_extract_options()) as ydl:
+        with yt_dlp.YoutubeDL(cast(Any, build_extract_options())) as ydl:
             info = ydl.extract_info(playlist_url, download=False)
-    except yt_dlp.utils.DownloadError as exc:
+    except DownloadError as exc:
         print(f"Failed to read playlist {playlist_url}: {exc}", file=sys.stderr)
         return []
 

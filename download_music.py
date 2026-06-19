@@ -53,6 +53,29 @@ def parse_args() -> argparse.Namespace:
         help="Load cookies from a local browser profile for private/restricted content.",
     )
     parser.add_argument(
+        "--cookie-file",
+        type=Path,
+        help="Path to an exported Netscape cookies.txt file (useful for age-restricted videos).",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=8,
+        help="Retry count for network errors.",
+    )
+    parser.add_argument(
+        "--fragment-retries",
+        type=int,
+        default=8,
+        help="Retry count for fragment download errors.",
+    )
+    parser.add_argument(
+        "--extractor-retries",
+        type=int,
+        default=5,
+        help="Retry count for extractor requests.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be downloaded without downloading files.",
@@ -89,6 +112,10 @@ def build_ydl_options(args: argparse.Namespace) -> dict:
         "ignoreerrors": True,
         "noplaylist": False,
         "download_archive": args.archive,
+        "retries": max(0, args.retries),
+        "fragment_retries": max(0, args.fragment_retries),
+        "extractor_retries": max(0, args.extractor_retries),
+        "file_access_retries": 3,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -100,6 +127,9 @@ def build_ydl_options(args: argparse.Namespace) -> dict:
 
     if args.cookies_from_browser:
         options["cookiesfrombrowser"] = (args.cookies_from_browser,)
+
+    if args.cookie_file:
+        options["cookiefile"] = str(args.cookie_file)
 
     if args.dry_run:
         options["skip_download"] = True

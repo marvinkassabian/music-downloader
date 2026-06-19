@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,20 @@ class DownloadJob:
     url: str
     output_path: Path
     playlist_name: str
+
+
+TRANSIENT_ERROR_PATTERNS = (
+    "connection reset by peer",
+    "connection aborted",
+    "timed out",
+    "read timed out",
+    "remote end closed connection",
+    "temporarily unavailable",
+)
+AGE_RESTRICTION_PATTERNS = (
+    "sign in to confirm your age",
+    "this video may be inappropriate for some users",
+)
 
 
 def _auto_workers(total_jobs: int) -> int:
@@ -43,20 +59,57 @@ def _job_options(base_options: dict[str, Any], output_path: Path) -> dict[str, A
 
 
 def _run_job(job: DownloadJob, base_options: dict[str, Any]) -> tuple[bool, str | None]:
-    try:
-        # Guard by final target file to avoid re-downloading when conversion already exists.
-        if job.output_path.exists():
-            return True, None
+    # Guard by final target file to avoid re-downloading when conversion already exists.
+    if job.output_path.exists():
+        return True, None
 
-        job.output_path.parent.mkdir(parents=True, exist_ok=True)
-        options = _job_options(base_options, job.output_path)
-        with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
-            result = ydl.download([job.url])
-        return result == 0, None
-    except DownloadError as exc:
-        return False, str(exc)
-    except Exception as exc:  # pragma: no cover - defensive catch for worker threads
-        return False, str(exc)
+    job.output_path.parent.mkdir(parents=True, exist_ok=True)
+    options = _job_options(base_options, job.output_path)
+
+    max_attempts = max(1, int(options.get("retries", 0)) + 1)
+    last_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
+                result = ydl.download([job.url])
+            return result == 0, None
+        except DownloadError as exc:
+            last_error = str(exc)
+            if not _is_transient_error(last_error):
+                break
+            if attempt < max_attempts:
+                # Small bounded backoff for transient network failures.
+                time.sleep(min(3.0, 0.5 * attempt))
+        except Exception as exc:  # pragma: no cover - defensive catch for worker threads
+            last_error = str(exc)
+            if not _is_transient_error(last_error):
+                break
+            if attempt < max_attempts:
+                time.sleep(min(3.0, 0.5 * attempt))
+
+    return False, last_error
+
+
+def _is_transient_error(error: str | None) -> bool:
+    if not error:
+        return False
+    normalized = error.lower()
+    return any(pattern in normalized for pattern in TRANSIENT_ERROR_PATTERNS)
+
+
+def _is_age_restricted_error(error: str | None) -> bool:
+    if not error:
+        return False
+    normalized = error.lower()
+    return any(pattern in normalized for pattern in AGE_RESTRICTION_PATTERNS)
+
+
+def _one_line_error(error: str | None) -> str | None:
+    if not error:
+        return None
+    collapsed = re.sub(r"\s+", " ", error).strip()
+    return collapsed[:280]
 
 
 def run_download_jobs(jobs: list[DownloadJob], ydl_options: dict[str, Any], max_download_workers: int) -> int:
@@ -100,10 +153,29 @@ def run_download_jobs(jobs: list[DownloadJob], ydl_options: dict[str, Any], max_
 
     if failures:
         print(f"Failed downloads: {len(failures)}/{len(pending_jobs)}")
+        age_restricted_count = 0
+        transient_count = 0
         for job, error in failures:
             print(f" - {job.playlist_name}: {job.output_path.name}")
-            if error:
-                print(f"   {error}")
+            one_line = _one_line_error(error)
+            if one_line:
+                print(f"   {one_line}")
+            if _is_age_restricted_error(error):
+                age_restricted_count += 1
+            elif _is_transient_error(error):
+                transient_count += 1
+
+        if age_restricted_count:
+            print(
+                "Hint: some tracks are age-restricted. Set COOKIES_FROM_BROWSER in main.py "
+                "or export cookies and set COOKIES_FILE to authenticate yt-dlp."
+            )
+
+        if transient_count:
+            print(
+                "Hint: transient network failures were detected. Retries are enabled; "
+                "rerunning usually completes remaining tracks."
+            )
         return 1
 
     print(f"Downloaded {len(pending_jobs)} new track(s) successfully.")
